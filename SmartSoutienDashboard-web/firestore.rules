@@ -1,0 +1,114 @@
+// firestore.rules
+// Déployer avec : firebase deploy --only firestore:rules
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Fonctions helpers ──────────────────────────────────────
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    function isAdmin() {
+      return isAuthenticated() &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+    function isParent() {
+      return isAuthenticated() &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'parent';
+    }
+    function isTeacher() {
+      return isAuthenticated() &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'teacher';
+    }
+    function isDeviceUser() {
+      return isAuthenticated() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'device';
+    }
+    function isDevice(deviceId) {
+      return isDeviceUser() &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.deviceId == deviceId;
+    }
+    function isDeviceAssignedToSession(deviceId, courseId, sessionId) {
+      let device = get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+      return isDevice(deviceId) && device.courseId == courseId && device.sessionId == sessionId;
+    }
+    function isOwnerParent(studentId) {
+      return isAuthenticated() &&
+        get(/databases/$(database)/documents/students/$(studentId)).data.parentId == request.auth.uid;
+    }
+
+    // ── Users ──────────────────────────────────────────────────
+    match /users/{userId} {
+      allow read: if isAuthenticated() && (request.auth.uid == userId || isAdmin());
+      allow write: if isAdmin();
+    }
+
+    // ── Students ───────────────────────────────────────────────
+    match /students/{studentId} {
+      allow read: if isAdmin() || isTeacher() || isDeviceUser() || isOwnerParent(studentId);
+      allow create, update, delete: if isAdmin();
+
+      // Paiements — sous-collection
+      match /payments/{paymentId} {
+        allow read: if isAdmin() || isOwnerParent(studentId);
+        allow write: if isAdmin();
+      }
+    }
+
+    // Collection-group queries do not inherit the nested match above.
+    // The admin payment and reporting screens query these groups directly.
+    match /{path=**}/payments/{paymentId} {
+      allow read: if isAdmin();
+    }
+
+    // ── Courses & Sessions & Présences ─────────────────────────
+    match /courses/{courseId} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
+
+      match /sessions/{sessionId} {
+        allow read: if isAuthenticated();
+        allow write: if isAdmin() || isTeacher();
+
+        match /attendances/{attendanceId} {
+          allow read: if isAdmin() || isTeacher() ||
+            (resource.data.studentId is string && isOwnerParent(resource.data.studentId));
+          // A device account may only write as the device ID stored on its users/{uid} record.
+          allow create: if isAdmin() || isTeacher() ||
+            (request.resource.data.deviceId is string &&
+             isDeviceAssignedToSession(request.resource.data.deviceId, courseId, sessionId));
+          allow update, delete: if isAdmin();
+        }
+      }
+    }
+
+    // Dashboard and analytics use a collection-group query across sessions.
+    // Keep this query access limited to staff; per-session device writes remain
+    // governed by the more specific rule above.
+    match /{path=**}/attendances/{attendanceId} {
+      allow read: if isAdmin() || isTeacher();
+    }
+
+    // ── Badges NFC ─────────────────────────────────────────────
+    match /badges/{badgeUID} {
+      allow read: if isAuthenticated() || isDeviceUser();
+      allow write: if isAdmin();
+    }
+
+    match /scan_logs/{scanLogId} {
+      allow read: if isAdmin();
+      allow create: if request.resource.data.deviceId is string &&
+        isDevice(request.resource.data.deviceId);
+    }
+
+    // ── Dispositifs ESP32 ──────────────────────────────────────
+    match /devices/{deviceId} {
+      allow read: if isAuthenticated();
+      allow create, update: if isAdmin() ||
+        (isDevice(deviceId) && request.resource.data.deviceId == deviceId);
+      allow delete: if isAdmin();
+    }
+  }
+}
